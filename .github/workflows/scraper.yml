@@ -31,9 +31,9 @@ jobs:
 
       - name: Run TikTok scraper
         env:
-          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           TIKTOK_URL: ${{ inputs.tiktok_url }}
           ROW_NUMBER: ${{ inputs.row_number }}
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
         run: python scraper.py

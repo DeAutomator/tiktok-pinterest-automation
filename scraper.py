@@ -1,181 +1,116 @@
+
 import os
 import json
-import yt_dlp
+import tempfile
+import mimetypes
+from pathlib import Path
+
 import gspread
-from google.oauth2.service_account import Credentials
+import requests
+import yt_dlp
 
 
-# -----------------------------
-# GOOGLE SHEETS CONNECTION
-# -----------------------------
+def main():
+    # Read information sent by Make through GitHub Actions
+    tiktok_url = os.environ["TIKTOK_URL"]
+    row_number = int(os.environ["ROW_NUMBER"])
+    webhook_url = os.environ["MAKE_WEBHOOK_URL"]
 
-SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-SPREADSHEET_ID = os.environ["GOOGLE_SHEET_ID"]
+    # Connect to Google Sheets
+    credentials = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    client = gspread.service_account_from_dict(credentials)
 
-credentials_info = json.loads(SERVICE_ACCOUNT_JSON)
+    spreadsheet = client.open_by_key(os.environ["GOOGLE_SHEET_ID"])
+    sheet = spreadsheet.worksheet("Videos")
 
-scopes = [
-    "https://www.googleapis.com/auth/spreadsheets"
-]
+    # Make sure this is the correct row
+    row = sheet.row_values(row_number)
 
-credentials = Credentials.from_service_account_info(
-    credentials_info,
-    scopes=scopes
-)
+    if not row or row[0].strip() != tiktok_url.strip():
+        raise ValueError("The TikTok URL does not match the selected sheet row.")
 
-client = gspread.authorize(credentials)
+    status = row[8].strip() if len(row) >= 9 else ""
 
-spreadsheet = client.open_by_key(SPREADSHEET_ID)
-sheet = spreadsheet.worksheet("Videos")
+    if status not in ("New", "Processing"):
+        raise ValueError(f"Row {row_number} has an unexpected status: {status}")
 
+    try:
+        sheet.update_acell(f"I{row_number}", "Processing")
 
-# -----------------------------
-# READ SHEET DATA
-# -----------------------------
+        # Download only this TikTok video
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_template = str(Path(temp_dir) / "video.%(ext)s")
 
-all_rows = sheet.get_all_values()
+            options = {
+                "outtmpl": output_template,
+                "format": "best",
+                "noplaylist": True,
+                "quiet": False,
+                "no_warnings": True,
+            }
 
-if not all_rows:
-    raise ValueError("The Google Sheet is empty.")
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(tiktok_url, download=True)
 
-headers = [header.strip() for header in all_rows[0]]
-
-required_headers = [
-    "TikTok URL",
-    "Creator",
-    "Caption",
-    "Video ID",
-    "Thumbnail",
-    "Video URL",
-    "Status"
-]
-
-for header in required_headers:
-    if header not in headers:
-        raise ValueError(f"Missing column: {header}")
-
-column = {
-    name: headers.index(name) + 1
-    for name in headers
-}
-
-# Collect video IDs already present in the sheet.
-existing_ids = {
-    row[column["Video ID"] - 1]
-    for row in all_rows[1:]
-    if len(row) >= column["Video ID"]
-    and row[column["Video ID"] - 1].strip()
-}
-
-
-# -----------------------------
-# TIKTOK SCRAPER
-# -----------------------------
-
-ydl_options = {
-    "quiet": True,
-    "no_warnings": True,
-    "skip_download": True,
-    "noplaylist": True
-}
-
-with yt_dlp.YoutubeDL(ydl_options) as ydl:
-
-    for row_number, row in enumerate(all_rows[1:], start=2):
-
-        tiktok_url = (
-            row[column["TikTok URL"] - 1].strip()
-            if len(row) >= column["TikTok URL"]
-            else ""
-        )
-
-        status = (
-            row[column["Status"] - 1].strip()
-            if len(row) >= column["Status"]
-            else ""
-        )
-
-        if not tiktok_url or status.lower() != "new":
-            continue
-
-        print(f"Processing row {row_number}: {tiktok_url}")
-
-        sheet.update_cell(
-            row_number,
-            column["Status"],
-            "Processing"
-        )
-
-        try:
-            info = ydl.extract_info(
-                tiktok_url,
-                download=False
-            )
-
-            video_id = str(info.get("id") or "")
-
-            if not video_id:
-                raise ValueError("Could not extract a video ID.")
-
-            if video_id in existing_ids:
-                sheet.update_cell(
-                    row_number,
-                    column["Status"],
-                    "Duplicate"
-                )
-                print(f"Duplicate video skipped: {video_id}")
-                continue
-
-            creator = (
-                info.get("uploader")
-                or info.get("channel")
-                or info.get("uploader_id")
-                or ""
-            )
-
-            caption = (
-                info.get("description")
-                or info.get("title")
-                or ""
-            )
-
-            thumbnail = info.get("thumbnail") or ""
-
-            # Update the metadata columns.
-            # Video URL is left blank for now because
-            # temporary TikTok stream URLs can expire.
-            values = [
-                creator,
-                caption,
-                video_id,
-                thumbnail,
-                ""
+            # Find the downloaded video file
+            video_files = [
+                file for file in Path(temp_dir).iterdir()
+                if file.is_file() and not file.name.endswith(".part")
             ]
 
-            for offset, value in enumerate(values):
-                sheet.update_cell(
-                    row_number,
-                    column["Creator"] + offset,
-                    value
+            if not video_files:
+                raise RuntimeError("The video download completed, but no video file was found.")
+
+            video_path = max(video_files, key=lambda file: file.stat().st_size)
+
+            # Extract video details
+            creator = info.get("uploader") or info.get("channel") or ""
+            caption = info.get("description") or info.get("title") or ""
+            video_id = info.get("id") or ""
+            thumbnail = info.get("thumbnail") or ""
+
+            # Update metadata in Google Sheets
+            sheet.update(
+                f"B{row_number}:F{row_number}",
+                [[creator, caption, video_id, thumbnail, ""]],
+                value_input_option="RAW",
+            )
+
+            # Send the video and its details to Make
+            mime_type = mimetypes.guess_type(video_path.name)[0] or "application/octet-stream"
+
+            form_data = {
+                "video_id": video_id,
+                "tiktok_url": tiktok_url,
+                "creator": creator,
+                "caption": caption,
+                "thumbnail": thumbnail,
+                "row_number": str(row_number),
+            }
+
+            with open(video_path, "rb") as video_file:
+                response = requests.post(
+                    webhook_url,
+                    data=form_data,
+                    files={
+                        "video": (video_path.name, video_file, mime_type)
+                    },
+                    timeout=300,
                 )
 
-            sheet.update_cell(
-                row_number,
-                column["Status"],
-                "Ready"
-            )
+            response.raise_for_status()
 
-            existing_ids.add(video_id)
+            print(f"Successfully sent row {row_number} to Make.")
 
-            print(f"Successfully processed: {video_id}")
+            # Leave the row as Processing.
+            # Make will change it to Published after Pinterest publishing succeeds.
 
-        except Exception as error:
-            print(f"Error processing row {row_number}: {error}")
 
-            sheet.update_cell(
-                row_number,
-                column["Status"],
-                "Failed"
-            )
+    except Exception as error:
+        sheet.update_acell(f"I{row_number}", "Failed")
+        print(f"Failed to process row {row_number}: {error}")
+        raise
 
-print("Scraper finished.")
+
+if __name__ == "__main__":
+    main()

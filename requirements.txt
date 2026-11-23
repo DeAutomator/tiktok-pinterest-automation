@@ -1,4 +1,2 @@
 yt-dlp
-gspread
-google-auth
 requests
